@@ -1,6 +1,9 @@
-# cad_recon_lib
+# cad_recon_lib_holefix
 
 Library-ized modules extracted from `3(0)_Dataset (PCD-voxel-BRep)_v4.ipynb`.
+This variant adds:
+- closed-solid prior for curved periodic faces with holes
+- periodic outer-shell recovery (`bbox - interior holes`) to prevent missing outer cylinders
 
 ## Modules
 
@@ -19,7 +22,7 @@ Library-ized modules extracted from `3(0)_Dataset (PCD-voxel-BRep)_v4.ipynb`.
 ## Quick Start
 
 ```python
-from cad_recon_lib import (
+from cad_recon_lib_holefix import (
     ABCMultiModalDataset,
     ReconstructionOptions,
     visualize_multimodal_sample,
@@ -36,5 +39,9 @@ sample = dataset[0]
 visualize_multimodal_sample(dataset, sample=sample)
 
 opts = ReconstructionOptions(fast_vis_mode=True)
-visualize_brep_reconstruction_comparison(sample, options=opts)
+visualize_brep_reconstruction_comparison(
+    sample,
+    options=opts,
+    enforce_closed_solid_prior=True,  # default True
+)
 ```

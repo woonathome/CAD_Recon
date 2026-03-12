@@ -1,4 +1,4 @@
-from cad_recon_lib import (
+from cad_recon_lib_holefix import (
     ABCMultiModalDataset,
     ReconstructionOptions,
     visualize_brep_reconstruction_comparison,
@@ -20,7 +20,11 @@ def main():
         fast_vis_mode=True,
         offset_x=2.5,
     )
-    visualize_brep_reconstruction_comparison(sample, options=opts)
+    visualize_brep_reconstruction_comparison(
+        sample,
+        options=opts,
+        enforce_closed_solid_prior=True,
+    )
 
 
 if __name__ == "__main__":

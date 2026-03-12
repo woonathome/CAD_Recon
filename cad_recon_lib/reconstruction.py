@@ -9,6 +9,7 @@ from shapely.ops import polygonize, snap, unary_union
 
 import OCC.Core.gp as gp
 from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
+from OCC.Core.BRepClass3d import BRepClass3d_SolidClassifier
 from OCC.Core.Geom import (
     Geom_ConicalSurface,
     Geom_CylindricalSurface,
@@ -29,9 +30,11 @@ from OCC.Core.GeomAbs import (
     GeomAbs_Torus,
 )
 from OCC.Core.gp import gp_Pnt
+from OCC.Core.TopAbs import TopAbs_IN, TopAbs_OUT, TopAbs_SOLID
+from OCC.Core.TopExp import TopExp_Explorer
 
 from .constants import COLOR_MAP, DEFAULT_COLOR
-from .occ_visualization import build_step_mesh_and_wireframe
+from .occ_visualization import build_step_mesh_and_wireframe, load_step_shape
 
 
 @dataclass
@@ -46,6 +49,10 @@ class ReconstructionOptions:
     fast_base_steps: int = 72
     fast_grid_min: int = 48
     fast_grid_max: int = 140
+    use_closed_solid_prior: bool = True
+    solid_probe_samples: int = 32
+    solid_probe_offset_ratio: float = 1e-3
+    solid_probe_boundary_ratio: float = 3.0
 
     window_width: int = 1600
     window_height: int = 900
@@ -63,6 +70,14 @@ def _to_numpy(arr):
 
 def _normalize_pts(pts, orig_center, max_dist):
     return (pts - orig_center) / max_dist
+
+
+def _state_is_inside(state):
+    return state == TopAbs_IN
+
+
+def _state_is_outside(state):
+    return state == TopAbs_OUT
 
 
 def build_reconstruction_geometries(
@@ -105,6 +120,20 @@ def build_reconstruction_geometries(
     orig_mesh.scale(1.0 / max_dist, center=(0, 0, 0))
     orig_wireframe.translate(-orig_center)
     orig_wireframe.scale(1.0 / max_dist, center=(0, 0, 0))
+
+    # Optional 3D solid prior:
+    # Dataset is filtered to single watertight body, so use it to disambiguate
+    # periodic-surface hole fill/complement candidates.
+    solid_classifier = None
+    if options.use_closed_solid_prior:
+        try:
+            solid_shape_root = load_step_shape(step_path)
+            solid_exp = TopExp_Explorer(solid_shape_root, TopAbs_SOLID)
+            if solid_exp.More():
+                solid_shape = solid_exp.Current()
+                solid_classifier = BRepClass3d_SolidClassifier(solid_shape)
+        except Exception:
+            solid_classifier = None
 
     # 2) Reconstructed edge wireframe
     offset = np.array([options.offset_x, 0.0, 0.0], dtype=np.float64)
@@ -398,6 +427,97 @@ def build_reconstruction_geometries(
                 su = unwrap_u(su, work_u_center)
                 seed_point = Point(float(su), float(sv))
 
+        # Solid prior score for single watertight body datasets:
+        # points on the true shell should have one side inside and one side outside.
+        def solid_prior_score(cand_clip):
+            if (
+                (not options.use_closed_solid_prior)
+                or (solid_classifier is None)
+                or (not periodic_u)
+                or cand_clip.is_empty
+            ):
+                return 0.0
+
+            min_u, min_v, max_u, max_v = cand_clip.bounds
+            du = max(abs(max_u - min_u) * 1e-4, 1e-5)
+            dv = max(abs(max_v - min_v) * 1e-4, 1e-5)
+            offset_len = max(max_dist * options.solid_probe_offset_ratio, 1e-5)
+            boundary_guard = chain_tol * options.solid_probe_boundary_ratio
+
+            target = max(8, int(options.solid_probe_samples))
+            grid_side = max(3, int(math.sqrt(target)) + 1)
+            u_grid = np.linspace(min_u, max_u, grid_side)
+            v_grid = np.linspace(min_v, max_v, grid_side)
+
+            good = 0.0
+            bad = 0.0
+            count = 0
+
+            for u in u_grid:
+                for v in v_grid:
+                    if count >= target:
+                        break
+                    p_uv = Point(float(u), float(v))
+                    if not cand_clip.covers(p_uv):
+                        continue
+                    if cand_clip.boundary.distance(p_uv) <= boundary_guard:
+                        continue
+
+                    u_eval = wrap_u_eval(u)
+                    v_eval = float(v)
+                    p = geom_surf.Value(float(u_eval), v_eval)
+
+                    u_eval_du = wrap_u_eval(u + du)
+                    v_eval_dv = v_eval + dv if (v_eval + dv) <= vmax else v_eval - dv
+                    v_eval_dv = min(float(vmax), max(float(vmin), float(v_eval_dv)))
+                    p_u = geom_surf.Value(float(u_eval_du), v_eval)
+                    p_v = geom_surf.Value(float(u_eval), float(v_eval_dv))
+
+                    t_u = np.array([p_u.X() - p.X(), p_u.Y() - p.Y(), p_u.Z() - p.Z()], dtype=np.float64)
+                    t_v = np.array([p_v.X() - p.X(), p_v.Y() - p.Y(), p_v.Z() - p.Z()], dtype=np.float64)
+                    n = np.cross(t_u, t_v)
+                    n_norm = np.linalg.norm(n)
+                    if n_norm <= 1e-12:
+                        continue
+                    n /= n_norm
+                    if is_reversed:
+                        n = -n
+
+                    p_plus = gp_Pnt(
+                        float(p.X() + n[0] * offset_len),
+                        float(p.Y() + n[1] * offset_len),
+                        float(p.Z() + n[2] * offset_len),
+                    )
+                    p_minus = gp_Pnt(
+                        float(p.X() - n[0] * offset_len),
+                        float(p.Y() - n[1] * offset_len),
+                        float(p.Z() - n[2] * offset_len),
+                    )
+
+                    solid_classifier.Perform(p_plus, 1e-6)
+                    state_plus = solid_classifier.State()
+                    solid_classifier.Perform(p_minus, 1e-6)
+                    state_minus = solid_classifier.State()
+
+                    plus_in = _state_is_inside(state_plus)
+                    minus_in = _state_is_inside(state_minus)
+                    plus_out = _state_is_outside(state_plus)
+                    minus_out = _state_is_outside(state_minus)
+
+                    if (plus_in and minus_out) or (minus_in and plus_out):
+                        good += 1.0
+                    elif plus_out and minus_out:
+                        bad += 1.0
+                    else:
+                        bad += 0.2
+                    count += 1
+                if count >= target:
+                    break
+
+            if count == 0:
+                return 0.0
+            return (good - 0.5 * bad) / count
+
         if edge_lines:
             try:
                 loops_uv = []
@@ -512,6 +632,24 @@ def build_reconstruction_geometries(
                             comp = bbox_poly.difference(parity_shape).buffer(0)
                             if not comp.is_empty and comp.area > area_tol:
                                 candidates.append(comp)
+
+                    if periodic_u:
+                        # For periodic cylindrical-like faces, interior loops are usually holes.
+                        # Build an explicit outer-shell candidate as bbox minus interior loops.
+                        interior_holes = []
+                        boundary_touch_tol = max(chain_tol * 1.5, uv_span * 1e-3)
+                        for poly in loop_polys:
+                            clipped = poly.intersection(bbox_poly).buffer(0)
+                            if clipped.is_empty or clipped.area <= area_tol:
+                                continue
+                            if clipped.area >= bbox_poly.area * 0.98:
+                                continue
+                            if clipped.boundary.distance(bbox_poly.boundary) > boundary_touch_tol:
+                                interior_holes.append(clipped)
+                        if interior_holes:
+                            shell_candidate = bbox_poly.difference(unary_union(interior_holes)).buffer(0)
+                            if not shell_candidate.is_empty and shell_candidate.area > area_tol:
+                                candidates.append(shell_candidate)
                 if not candidates:
                     candidates = [bbox_poly]
 
@@ -548,13 +686,40 @@ def build_reconstruction_geometries(
                         if seed_dist > chain_tol:
                             score += 2.5 if cand_clip.covers(seed_point) else -2.5
 
+                    # Strong disambiguation for curved periodic faces with holes.
+                    score += 8.0 * solid_prior_score(cand_clip)
+
                     fill_ratio = cand_clip.area / max(bbox_poly.area, 1e-12)
                     if fill_ratio < 0.01 or fill_ratio > 0.99:
                         score -= 0.5
+                    if periodic_u:
+                        # Bias away from degenerate tiny strips on periodic side faces.
+                        score += 1.2 * fill_ratio
                     return score
 
                 scored = sorted(((score_candidate(c), c) for c in candidates), key=lambda x: x[0], reverse=True)
                 best_poly = scored[0][1] if scored else bbox_poly
+
+                if periodic_u and len(scored) > 1:
+                    best_score, best_geom = scored[0]
+                    best_clip = best_geom.intersection(bbox_poly).buffer(0)
+                    best_area = best_clip.area if not best_clip.is_empty else 0.0
+                    best_fill = best_area / max(bbox_poly.area, 1e-12)
+
+                    alt_score, alt_geom = max(
+                        scored,
+                        key=lambda x: (x[1].intersection(bbox_poly).buffer(0).area if not x[1].is_empty else 0.0),
+                    )
+                    alt_clip = alt_geom.intersection(bbox_poly).buffer(0)
+                    alt_area = alt_clip.area if not alt_clip.is_empty else 0.0
+
+                    if (
+                        best_fill < 0.35
+                        and alt_area > best_area * 1.5
+                        and alt_score >= (best_score - 1.25)
+                    ):
+                        best_poly = alt_geom
+
                 best_poly = best_poly.intersection(bbox_poly).buffer(0)
                 if best_poly.is_empty or best_poly.area <= area_tol:
                     best_poly = bbox_poly
@@ -635,8 +800,10 @@ def visualize_brep_reconstruction_comparison(
     options: Optional[ReconstructionOptions] = None,
     color_map=None,
     default_color=None,
+    enforce_closed_solid_prior: bool = True,
 ):
     options = ReconstructionOptions() if options is None else options
+    options.use_closed_solid_prior = enforce_closed_solid_prior
     geom = build_reconstruction_geometries(
         sample=sample,
         options=options,
