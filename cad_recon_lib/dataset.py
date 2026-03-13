@@ -38,6 +38,7 @@ class ABCMultiModalDataset(Dataset):
         max_vertices=4000,
         max_edges=2000,
         max_faces=1000,
+        max_view_retry=8,
     ):
         self.base_dir = Path(base_dir)
         self.pcd_num_points = pcd_num_points
@@ -45,6 +46,7 @@ class ABCMultiModalDataset(Dataset):
         self.max_vertices = max_vertices
         self.max_edges = max_edges
         self.max_faces = max_faces
+        self.max_view_retry = int(max_view_retry)
         self.device = o3d.core.Device("CPU:0")
 
         self.obj_files = []
@@ -325,8 +327,23 @@ class ABCMultiModalDataset(Dataset):
         mesh = o3d.io.read_triangle_mesh(str(obj_path))
         mesh.translate(-mesh.get_center())
         max_mesh_dist = np.max(np.linalg.norm(np.asarray(mesh.vertices), axis=1))
+        if not np.isfinite(max_mesh_dist) or max_mesh_dist < 1e-8:
+            max_mesh_dist = 1.0
 
-        raw_sim_points = self._simulate_stereo_depth(mesh, max_mesh_dist)
+        raw_sim_points = np.empty((0, 3), dtype=np.float32)
+        for _ in range(max(1, self.max_view_retry)):
+            raw_sim_points = self._simulate_stereo_depth(mesh, max_mesh_dist)
+            if raw_sim_points.shape[0] > 0:
+                break
+
+        # Fallback path for rare camera-miss cases.
+        if raw_sim_points.shape[0] == 0:
+            sampled = mesh.sample_points_uniformly(number_of_points=max(self.pcd_num_points, 2048))
+            raw_sim_points = np.asarray(sampled.points, dtype=np.float32)
+
+        if raw_sim_points.shape[0] == 0:
+            raw_sim_points = np.zeros((self.pcd_num_points, 3), dtype=np.float32)
+
         pcd_pts = raw_sim_points / (max_mesh_dist + 1e-8)
 
         if len(pcd_pts) >= self.pcd_num_points:
