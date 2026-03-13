@@ -153,6 +153,6 @@ if __name__ == "__main__":
     BASE_DIRECTORY = "./abc_dataset_filtered-1"
     TIMEOUT_LIMIT = 180 # 3분 (180초)
 
-    # 예: 8번 청크부터 19번 청크까지 실행
-    for i in range(15, 20): 
+    # 예: 1번 청크부터 20번 청크까지 실행
+    for i in range(17, 25): 
         process_chunk(BASE_DIRECTORY, i, timeout_sec=TIMEOUT_LIMIT)
