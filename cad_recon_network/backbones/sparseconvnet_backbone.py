@@ -42,13 +42,15 @@ class _DenseVoxelFallbackBackbone(nn.Module):
             nn.BatchNorm3d(c3),
             nn.ReLU(inplace=True),
         )
-        self.pool = nn.AdaptiveAvgPool3d(1)
         self.proj = nn.Identity() if feature_dim == c3 else nn.Linear(c3, feature_dim)
 
     def forward(self, voxel: torch.Tensor) -> torch.Tensor:
         dense = self.encoder(voxel)
-        pooled = self.pool(dense).flatten(1)
-        return self.proj(pooled)
+        cx = int(dense.shape[2] // 2)
+        cy = int(dense.shape[3] // 2)
+        cz = int(dense.shape[4] // 2)
+        center_token = dense[:, :, cx, cy, cz]
+        return self.proj(center_token)
 
 
 class SparseConvNetBackbone(nn.Module):
@@ -91,9 +93,8 @@ class SparseConvNetBackbone(nn.Module):
                 .add(scn.SubmanifoldConvolution(3, in_channels, base_channels, 3, False))
                 .add(scn.UNet(3, reps, list(unet_planes), residual_blocks=False, downsample=[2, 2]))
                 .add(scn.BatchNormReLU(base_channels))
-                .add(scn.SparseToDense(3, base_channels))
             )
-            self.pool = nn.AdaptiveAvgPool3d(1)
+            self.output_layer = scn.OutputLayer(3)
             self.proj = nn.Identity() if feature_dim == base_channels else nn.Linear(base_channels, feature_dim)
         except Exception as exc:
             if not allow_fallback:
@@ -132,14 +133,15 @@ class SparseConvNetBackbone(nn.Module):
             )
         return voxel
 
-    def _dense_to_sparse(self, voxel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _dense_to_sparse(self, voxel: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # voxel: [B, C, X, Y, Z]
-        batch_size, _, sx, sy, sz = voxel.shape
+        batch_size, _, _, _, _ = voxel.shape
         active = voxel.abs().amax(dim=1) > self.occupancy_threshold
         raw_idx = active.nonzero(as_tuple=False)  # [N, 4] => b,x,y,z
 
         coords = []
         feats = []
+        anchor_rows: list[int] = []
 
         if raw_idx.numel() > 0:
             xyzb = torch.stack(
@@ -156,17 +158,45 @@ class SparseConvNetBackbone(nn.Module):
             coords.append(xyzb)
             feats.append(values)
 
-        present = set(raw_idx[:, 0].tolist()) if raw_idx.numel() > 0 else set()
+        occupied: list[set[tuple[int, int, int]]] = [set() for _ in range(batch_size)]
+        if raw_idx.numel() > 0:
+            for b, x, y, z in raw_idx.cpu().tolist():
+                occupied[int(b)].add((int(x), int(y), int(z)))
+
+        running_count = int(sum(int(c.shape[0]) for c in coords))
+        vmax = self.voxel_resolution - 1
         center = self.voxel_resolution // 2
+        candidates = [
+            (0, 0, 0),
+            (0, 0, vmax),
+            (0, vmax, 0),
+            (vmax, 0, 0),
+            (vmax, vmax, vmax),
+            (vmax, vmax, 0),
+            (vmax, 0, vmax),
+            (0, vmax, vmax),
+            (center, center, center),
+        ]
         for b in range(batch_size):
-            if b in present:
-                continue
-            coords.append(torch.tensor([[center, center, center, b]], dtype=torch.long, device=voxel.device))
+            anchor_xyz = None
+            occ = occupied[b]
+            for cand in candidates:
+                if cand not in occ:
+                    anchor_xyz = cand
+                    break
+            if anchor_xyz is None:
+                anchor_xyz = (center, center, center)
+
+            ax, ay, az = anchor_xyz
+            coords.append(torch.tensor([[ax, ay, az, b]], dtype=torch.long, device=voxel.device))
             feats.append(torch.zeros((1, self.in_channels), dtype=voxel.dtype, device=voxel.device))
+            anchor_rows.append(running_count)
+            running_count += 1
 
         all_coords = torch.cat(coords, dim=0).to(dtype=torch.long, device="cpu")
         all_feats = torch.cat(feats, dim=0).to(dtype=torch.float32)
-        return all_coords, all_feats
+        anchor_index = torch.tensor(anchor_rows, dtype=torch.long, device=all_feats.device)
+        return all_coords, all_feats, anchor_index
 
     def forward(self, voxel: torch.Tensor) -> torch.Tensor:
         voxel = self._prepare_voxel(voxel)
@@ -174,8 +204,10 @@ class SparseConvNetBackbone(nn.Module):
             return self.fallback_model(voxel)  # type: ignore[misc]
 
         batch_size = int(voxel.shape[0])
-        coords, feats = self._dense_to_sparse(voxel)
+        coords, feats, anchor_rows = self._dense_to_sparse(voxel)
         sparse_input = self.input_layer([coords, feats, batch_size])
-        dense_feat = self.sparse_model(sparse_input)
-        pooled = self.pool(dense_feat).flatten(1)
-        return self.proj(pooled)
+        sparse_feat = self.sparse_model(sparse_input)
+        per_input_feat = self.output_layer(sparse_feat)
+        anchor_rows = anchor_rows.to(device=per_input_feat.device, dtype=torch.long)
+        anchor_feat = per_input_feat.index_select(0, anchor_rows)
+        return self.proj(anchor_feat)

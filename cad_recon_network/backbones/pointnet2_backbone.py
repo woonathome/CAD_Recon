@@ -74,6 +74,20 @@ class PointNet2Backbone(nn.Module):
             for p in self.model.parameters():
                 p.requires_grad = False
 
+    def _extract_global_token(self, points: torch.Tensor) -> torch.Tensor:
+        # Use only SA blocks (no classification FC head) to get the global 1024-d token.
+        if self.use_normals:
+            norm = points[:, 3:, :]
+            xyz = points[:, :3, :]
+        else:
+            norm = None
+            xyz = points
+
+        l1_xyz, l1_points = self.model.sa1(xyz, norm)
+        l2_xyz, l2_points = self.model.sa2(l1_xyz, l1_points)
+        _, l3_points = self.model.sa3(l2_xyz, l2_points)
+        return l3_points
+
     def _prepare_points(self, pcd: torch.Tensor) -> torch.Tensor:
         if pcd.dim() != 3:
             raise ValueError(f"`pcd` must be [B,N,C] or [B,C,N], got shape={tuple(pcd.shape)}")
@@ -105,9 +119,9 @@ class PointNet2Backbone(nn.Module):
         # Keep this path out of autocast to avoid occasional CUDA index asserts.
         if points.device.type == "cuda":
             with torch.autocast(device_type="cuda", enabled=False):
-                _, global_token = self.model(points.float())
+                global_token = self._extract_global_token(points.float())
         else:
-            _, global_token = self.model(points.float())
+            global_token = self._extract_global_token(points.float())
 
         feat = global_token.squeeze(-1).contiguous()
         return self.proj(feat)
