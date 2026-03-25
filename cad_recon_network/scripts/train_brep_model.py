@@ -41,7 +41,33 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CADReconBRepModel end-to-end.")
     parser.add_argument("--base-dir", type=str, required=True, help="Root directory passed to ABCMultiModalDataset.")
     parser.add_argument("--output-dir", type=str, default="cad_recon_network/weights/brep_runs/exp1")
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="default",
+        choices=["default", "exp1"],
+        help="Training strategy preset. `exp1` applies the same optimization setup used in exp1 run.",
+    )
     parser.add_argument("--resume", type=str, default="", help="Path to checkpoint (.pt) to resume from.")
+    parser.add_argument(
+        "--init-model-from",
+        type=str,
+        default="",
+        help="Path to checkpoint (.pt) used only to initialize model weights (optimizer/scaler/epoch are reset).",
+    )
+    parser.add_argument(
+        "--init-model-strict",
+        dest="init_model_strict",
+        action="store_true",
+        help="Use strict=True when loading model-only initialization checkpoint.",
+    )
+    parser.add_argument(
+        "--init-model-non-strict",
+        dest="init_model_strict",
+        action="store_false",
+        help="Use strict=False when loading model-only initialization checkpoint.",
+    )
+    parser.set_defaults(init_model_strict=True)
 
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--epochs", type=int, default=50)
@@ -120,6 +146,55 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def apply_strategy_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if args.strategy != "exp1":
+        return args
+
+    # Reuse the optimization setup that was used for exp1.
+    args.batch_size = 8
+    args.num_workers = 0
+    args.lr = 1e-4
+    args.weight_decay = 1e-5
+    args.grad_clip = 1.0
+    args.val_ratio = 0.05
+    args.amp = True
+    args.freeze_pointnet_bn = True
+
+    args.pcd_num_points = 2048
+    args.voxel_res = 64
+    args.max_vertices = 4000
+    args.max_edges = 2000
+    args.max_faces = 1000
+    args.max_view_retry = 8
+    args.regression_target_clip = 200.0
+
+    args.pointnet_variant = "ssg"
+    args.pointnet_feature_dim = 1024
+    args.sparse_feature_dim = 256
+    args.head_hidden_dim = 256
+    args.head_layers = 2
+    args.head_latents = 64
+    args.head_heads = 8
+    args.dropout = 0.1
+    args.num_curve_types = 9
+    args.num_surface_types = 11
+
+    args.w_v_feat = 1.0
+    args.w_e_feat = 1.0
+    args.w_f_feat = 1.0
+    args.w_e_type = 0.5
+    args.w_f_type = 0.5
+    args.w_e_ori = 0.25
+    args.w_f_ori = 0.25
+    args.w_adj_ev = 0.5
+    args.w_adj_fe = 0.5
+    args.w_counts = 0.2
+
+    if not args.resume:
+        args.resume = "cad_recon_network/weights/brep_runs/exp1/last.pt"
+    return args
 
 
 def cad_collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -368,6 +443,7 @@ def save_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    args = apply_strategy_preset(args)
     set_seed(args.seed)
 
     device = torch.device(args.device)
@@ -431,6 +507,23 @@ def main() -> None:
 
     start_epoch = 1
     best_val_loss = float("inf")
+    if args.resume and args.init_model_from:
+        raise ValueError("Use either --resume or --init-model-from, not both.")
+
+    if args.init_model_from:
+        ckpt_path = Path(args.init_model_from)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Initialization checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model_state = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+        incompatible = model.load_state_dict(model_state, strict=args.init_model_strict)
+        if not args.init_model_strict:
+            print(
+                "Initialized model weights (non-strict). "
+                f"missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)}"
+            )
+        print(f"Initialized model weights from {ckpt_path}. Optimizer/scaler/epoch are reset.")
+
     if args.resume:
         ckpt_path = Path(args.resume)
         if not ckpt_path.exists():
