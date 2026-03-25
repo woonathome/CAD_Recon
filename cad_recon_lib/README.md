@@ -1,4 +1,4 @@
-# cad_recon_lib_holefix
+# cad_recon_lib
 
 Library-ized modules extracted from `3(0)_Dataset (PCD-voxel-BRep)_v4.ipynb`.
 This variant adds:
@@ -22,7 +22,7 @@ This variant adds:
 ## Quick Start
 
 ```python
-from cad_recon_lib_holefix import (
+from cad_recon_lib import (
     ABCMultiModalDataset,
     ReconstructionOptions,
     visualize_multimodal_sample,
