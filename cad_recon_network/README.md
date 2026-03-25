@@ -116,9 +116,22 @@ python cad_recon_network/scripts/train_brep_model.py `
   --regression-target-clip 200
 ```
 
+Resume with exp1 strategy preset:
+```powershell
+python cad_recon_network/scripts/train_brep_model.py `
+  --base-dir ".\abc_dataset_filtered-1" `
+  --output-dir "cad_recon_network/weights/brep_runs/exp1" `
+  --device cuda `
+  --epochs 50 `
+  --strategy exp1
+```
+
 Notes:
 - `batch-size=1` is supported by default because PointNet BatchNorm is kept in eval mode during training.
 - Checkpoints are saved to `last.pt` (periodic) and `best.pt` (best validation loss).
+- Continue full-state training (model + optimizer + epoch): `--resume ".../last.pt"`.
+- Warm-start only model parameters (optimizer/LR/epoch reset): `--init-model-from ".../last.pt"`.
+- `--strategy exp1` re-applies exp1 optimization setup and auto-fills `--resume` to `cad_recon_network/weights/brep_runs/exp1/last.pt` if omitted.
 - `e_feat/f_feat` losses are split: `type` and `orientation` use classification losses, remaining indices use regression loss.
 - Epoch-wise term losses are saved to `epoch_losses.csv` (train/val columns for each loss term).
 - Camera-miss cases (`pcd hit=0`) are retried and then fallback to mesh point sampling, so DataLoader no longer crashes on empty PCD.
