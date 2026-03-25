@@ -1,4 +1,4 @@
-from cad_recon_lib_holefix import (
+from cad_recon_lib import (
     ABCMultiModalDataset,
     ReconstructionOptions,
     visualize_brep_reconstruction_comparison,
